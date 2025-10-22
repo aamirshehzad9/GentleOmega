@@ -16,10 +16,14 @@ from blockchain_client import record_pod, record_poe, cleanup_blockchain_client
 # Import orchestration system
 from orchestrator import start_orchestration, stop_orchestration, submit_create_item_task, get_orchestration_health
 
+# Import chain orchestrator
+from chain_orchestrator import get_orchestrator_stats, run_single_cycle
+
 # Load environment variables
 load_dotenv(dotenv_path=os.path.join("env", ".env"))
 
 HF_TOKEN        = os.getenv("HF_TOKEN")
+OPENAI_API_KEY  = os.getenv("OPENAI_API_KEY")
 OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "https://router.huggingface.co/v1")
 GEN_MODEL       = os.getenv("GEN_MODEL")
 
@@ -32,7 +36,18 @@ PG_DB   = os.getenv("PG_DB", "metacity")
 PG_USER = os.getenv("PG_USER", "postgres")
 PG_PASS = os.getenv("PG_PASSWORD")
 
-client = OpenAI(base_url=OPENAI_BASE_URL, api_key=HF_TOKEN)
+# Guard OpenAI client init - don't crash if tokens missing
+client = None
+api_key = HF_TOKEN or OPENAI_API_KEY
+if api_key and api_key != "REPLACE_WITH_YOUR_HF_TOKEN":
+    try:
+        client = OpenAI(base_url=OPENAI_BASE_URL, api_key=api_key)
+        print("✅ OpenAI client initialized successfully")
+    except Exception as e:
+        print(f"⚠️  OpenAI client initialization failed: {e}")
+        client = None
+else:
+    print("⚠️  No valid API token found - LLM functionality disabled")
 
 # Optional local embeddings - temporarily disabled for testing
 # if EMB_BACKEND == "local":
@@ -60,8 +75,8 @@ class AskPayload(BaseModel):
 
 # --- Embedding utility ---
 def embed_text(text: str) -> List[float]:
-    # Temporarily return mock embeddings for testing
-    if EMB_BACKEND == "local":
+    # Return mock embeddings for testing or when no client available
+    if EMB_BACKEND == "local" or not client:
         # Return a fixed-size mock embedding vector
         return [0.1] * 384
     else:
@@ -120,15 +135,18 @@ def retrieve(agent: str, user_id: str, query: str, k: int = 10) -> List[str]:
 # --- Generate ---
 def generate(messages: List[Dict[str, str]]) -> str:
     # For testing without API, return a mock response
-    if not HF_TOKEN or HF_TOKEN == "REPLACE_WITH_YOUR_HF_TOKEN":
+    if not client:
         return "Mock response: This is a test response since no valid API token is configured."
     
-    resp = client.chat.completions.create(
-        model=GEN_MODEL,
-        messages=messages,
-        temperature=0.4,
-    )
-    return resp.choices[0].message.content
+    try:
+        resp = client.chat.completions.create(
+            model=GEN_MODEL,
+            messages=messages,
+            temperature=0.4,
+        )
+        return resp.choices[0].message.content
+    except Exception as e:
+        return f"Error generating response: {str(e)}"
 
 
 # --- Live session loop ---
@@ -345,13 +363,20 @@ async def get_item(item_id: int, background_tasks: BackgroundTasks):
 
 
 @app.get("/health")
-def health():
+async def health():
     orchestration_health = get_orchestration_health()
+    chain_stats = await get_orchestrator_stats()
+    
     return {
         "status": "ok", 
         "dim": DIM, 
         "blockchain": "enabled",
-        "orchestration": orchestration_health
+        "orchestration": orchestration_health,
+        "components": {
+            "rpc_connectivity": chain_stats.get("rpc_connectivity", False),
+            "chain_latency_ms": chain_stats.get("chain_latency_ms", -1),
+            "last_block": chain_stats.get("last_block", -1)
+        }
     }
 
 @app.get("/orchestration/status")
@@ -370,15 +395,189 @@ def submit_orchestration_task(content: str, user_id: str = "default"):
     }
 
 
+@app.get("/chain/status")
+async def chain_status():
+    """Get blockchain integration status - Phase 4 endpoint"""
+    stats = await get_orchestrator_stats()
+    
+    return {
+        "status": stats.get("status", "unknown"),
+        "last_block": stats.get("last_block", -1),
+        "pending_tx": stats.get("pending_tx", 0),
+        "verified": stats.get("confirmed_tx", 0),
+        "failed_tx": stats.get("failed_tx", 0),
+        "queued_tx": stats.get("queued_tx", 0),
+        "rpc_latency_ms": stats.get("chain_latency_ms", -1),
+        "rpc_ok": stats.get("rpc_connectivity", False)
+    }
+
+
+@app.post("/chain/cycle")
+async def trigger_chain_cycle():
+    """Manually trigger a single chain orchestration cycle"""
+    try:
+        metrics = await run_single_cycle()
+        return {
+            "status": "success",
+            "message": "Chain cycle completed successfully",
+            "metrics": metrics
+        }
+    except Exception as e:
+        return {
+            "status": "error",
+            "message": f"Chain cycle failed: {str(e)}"
+        }
+
+
+@app.get("/logs/recent")
+async def get_recent_logs(lines: int = 50):
+    """Get recent lines from chain sync log"""
+    try:
+        log_file = "logs/chain_sync.log"
+        if not os.path.exists(log_file):
+            return {"logs": [], "message": "Log file not found"}
+        
+        with open(log_file, "r", encoding="utf-8", errors="ignore") as f:
+            all_lines = f.readlines()
+            recent_lines = all_lines[-lines:] if len(all_lines) > lines else all_lines
+            
+        return {
+            "logs": [line.strip() for line in recent_lines],
+            "total_lines": len(all_lines),
+            "returned_lines": len(recent_lines)
+        }
+    except Exception as e:
+        return {
+            "status": "error",
+            "message": f"Failed to read logs: {str(e)}"
+        }
+
+
+@app.get("/chain/ledger")
+async def get_blockchain_ledger(limit: int = 100, status_filter: str = None):
+    """Get blockchain ledger entries with optional status filtering"""
+    try:
+        with pg.cursor() as cur:
+            if status_filter:
+                cur.execute("""
+                    SELECT id, poe_hash, tx_hash, block_number, status, created_at, updated_at
+                    FROM blockchain_ledger 
+                    WHERE status = %s
+                    ORDER BY updated_at DESC 
+                    LIMIT %s
+                """, (status_filter, limit))
+            else:
+                cur.execute("""
+                    SELECT id, poe_hash, tx_hash, block_number, status, created_at, updated_at
+                    FROM blockchain_ledger 
+                    ORDER BY updated_at DESC 
+                    LIMIT %s
+                """, (limit,))
+            
+            rows = cur.fetchall()
+            columns = [desc[0] for desc in cur.description]
+            
+            ledger_entries = []
+            for row in rows:
+                entry = dict(zip(columns, row))
+                # Convert timestamps to ISO format
+                if entry['created_at']:
+                    entry['created_at'] = entry['created_at'].isoformat()
+                if entry['updated_at']:
+                    entry['updated_at'] = entry['updated_at'].isoformat()
+                ledger_entries.append(entry)
+            
+        return {
+            "ledger": ledger_entries,
+            "count": len(ledger_entries),
+            "filter": status_filter
+        }
+    except Exception as e:
+        return {
+            "status": "error",
+            "message": f"Failed to fetch ledger: {str(e)}"
+        }
+
+
+@app.get("/chain/metrics")
+async def get_chain_metrics():
+    """Get detailed chain metrics for dashboard"""
+    try:
+        with pg.cursor() as cur:
+            # Get status counts
+            cur.execute("""
+                SELECT status, COUNT(*) as count
+                FROM blockchain_ledger 
+                GROUP BY status
+            """)
+            status_counts = {row[0]: row[1] for row in cur.fetchall()}
+            
+            # Get latest confirmed block
+            cur.execute("""
+                SELECT MAX(block_number) as last_confirmed_block
+                FROM blockchain_ledger 
+                WHERE status = 'confirmed' AND block_number IS NOT NULL
+            """)
+            result = cur.fetchone()
+            last_confirmed_block = result[0] if result and result[0] else -1
+            
+            # Get total ledger count
+            cur.execute("SELECT COUNT(*) FROM blockchain_ledger")
+            ledger_total = cur.fetchone()[0]
+            
+            # Get last update timestamp
+            cur.execute("""
+                SELECT MAX(updated_at) as last_updated
+                FROM blockchain_ledger
+            """)
+            result = cur.fetchone()
+            last_updated = result[0].isoformat() if result and result[0] else None
+        
+        # Get RPC connectivity
+        from chain_orchestrator import ping_rpc, get_chain_head
+        rpc_ok, latency = ping_rpc()
+        current_block = get_chain_head() if rpc_ok else -1
+        
+        return {
+            "status_counts": status_counts,
+            "last_confirmed_block": last_confirmed_block,
+            "current_block": current_block,
+            "ledger_total": ledger_total,
+            "last_updated": last_updated,
+            "rpc_connectivity": rpc_ok,
+            "rpc_latency_ms": latency,
+            "blockchain_synced": current_block == last_confirmed_block if current_block > 0 else False
+        }
+    except Exception as e:
+        return {
+            "status": "error",
+            "message": f"Failed to get metrics: {str(e)}"
+        }
+
+
 # Startup handler for orchestration system
 @app.on_event("startup")
 async def startup_event():
     """Initialize orchestration system on app startup"""
     try:
         await start_orchestration()
-        print("GentleOmega Orchestration System started successfully")
+        print("✅ GentleOmega Orchestration System started successfully")
+        
+        # Start background chain orchestrator
+        from chain_orchestrator import orchestration_loop
+        asyncio.create_task(orchestration_loop())
+        print("🔗 GentleOmega Chain Orchestrator started in background")
+        
+        # Check chain connectivity 
+        chain_stats = await get_orchestrator_stats()
+        if chain_stats.get("rpc_connectivity"):
+            print(f"✅ GentleΩ Phase 4 Live Blockchain Integration Operational")
+            print(f"   📊 Chain: Block {chain_stats.get('last_block', 'N/A')}, Latency: {chain_stats.get('chain_latency_ms', 'N/A')}ms")
+        else:
+            print("⚠️  GentleΩ Phase 4 running in simulation mode (no RPC connectivity)")
+            
     except Exception as e:
-        print(f"Warning: Orchestration startup failed: {e}")
+        print(f"Warning: System startup error: {e}")
 
 # Shutdown handler for cleanup
 @app.on_event("shutdown")
@@ -387,6 +586,6 @@ async def shutdown_event():
     try:
         await stop_orchestration()
         await cleanup_blockchain_client()
-        print("GentleOmega systems shutdown complete")
+        print("👋 GentleΩ systems shutdown complete")
     except Exception as e:
         print(f"Warning: Shutdown error: {e}")

@@ -1,17 +1,21 @@
 """
-GentleΩ Blockchain Client - PoD → PoE Integration
+GentleΩ Blockchain Client - Phase 4 EVM Integration
 Handles Proof of Data (PoD) and Proof of Execution (PoE) recording
-Enhanced with local blockchain ledger database integration
+Enhanced with EVM blockchain transaction support and local ledger
 """
 
 import os
 import sys
 import json
+import time
+import logging
 import hashlib
 import asyncio
+import binascii
 from datetime import datetime, timezone
-from typing import Dict, Any, Optional
-import aiohttp
+from typing import Dict, Any, Optional, Tuple
+from decimal import Decimal
+import httpx
 from dotenv import load_dotenv
 
 # Add current directory to path for imports
@@ -25,6 +29,17 @@ CHAIN_RPC = os.getenv("CHAIN_RPC", "https://your-chain-endpoint")
 WALLET_PRIVATE_KEY = os.getenv("WALLET_PRIVATE_KEY", "your_private_key")
 WALLET_ADDRESS = os.getenv("WALLET_ADDRESS", "your_wallet_address")
 
+# Setup logging
+os.makedirs("logs", exist_ok=True)
+logger = logging.getLogger("chain")
+logger.setLevel(logging.INFO)
+fh = logging.FileHandler("logs/chain_sync.log", encoding="utf-8")
+fh.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(message)s"))
+logger.addHandler(fh)
+
+# EVM transaction support
+USE_PERSONAL = False  # set True only if your node supports personal_sendTransaction
+
 # Database configuration
 PG_HOST = os.getenv("PG_HOST", "127.0.0.1")
 PG_PORT = int(os.getenv("PG_PORT", "5432"))
@@ -33,14 +48,163 @@ PG_USER = os.getenv("PG_USER", "postgres")
 PG_PASS = os.getenv("PG_PASSWORD", "postgres")
 
 
+class RPC:
+    """Simple EVM JSON-RPC client"""
+    def __init__(self, url: str):
+        self.c = httpx.Client(timeout=20.0)
+        self.url = url
+        self._id = 0
+
+    def call(self, method: str, params: list) -> Any:
+        self._id += 1
+        payload = {"jsonrpc": "2.0", "id": self._id, "method": method, "params": params}
+        r = self.c.post(self.url, json=payload)
+        r.raise_for_status()
+        data = r.json()
+        if "error" in data:
+            raise RuntimeError(f"RPC error {data['error']}")
+        return data["result"]
+
+
+# Global RPC client
+rpc = RPC(CHAIN_RPC) if CHAIN_RPC and CHAIN_RPC != "https://your-chain-endpoint" else None
+
+
+def _to_hex(val: int) -> str:
+    """Convert integer to hex string"""
+    return hex(val)
+
+
+def _ensure_0x(h: str) -> str:
+    """Ensure hex string has 0x prefix"""
+    return h if h.startswith("0x") else "0x" + h
+
+
+def get_chain_head() -> int:
+    """Get latest block number"""
+    if not rpc:
+        return -1
+    block_hex = rpc.call("eth_blockNumber", [])
+    return int(block_hex, 16)
+
+
+def get_nonce(address: str) -> int:
+    """Get transaction nonce for address"""
+    if not rpc:
+        return 0
+    n_hex = rpc.call("eth_getTransactionCount", [address, "pending"])
+    return int(n_hex, 16)
+
+
+def estimate_fees() -> Tuple[int, int]:
+    """Estimate EIP-1559 fees"""
+    if not rpc:
+        return 1_500_000_000, 2_000_000_000  # Fallback values
+    
+    try:
+        # EIP-1559 style
+        base = rpc.call("eth_feeHistory", [1, "latest", []])
+        # fallback tips
+        tip_hex = rpc.call("eth_maxPriorityFeePerGas", [])
+        priority = int(tip_hex, 16) if isinstance(tip_hex, str) else 1_500_000_000
+        # latest baseFee from history
+        base_fee = int(base["baseFeePerGas"][-1], 16)
+        max_fee = base_fee + priority * 2
+        return priority, max_fee
+    except Exception:
+        return 1_500_000_000, 2_000_000_000  # Fallback values
+
+
+def _poe_data_bytes(poe_hash_hex: str) -> str:
+    """
+    Accept poe_hash as hex string (with or without 0x). Pad to even length.
+    Return hex data string with 0x prefix suitable for tx 'data'.
+    """
+    h = poe_hash_hex[2:] if poe_hash_hex.startswith("0x") else poe_hash_hex
+    if len(h) % 2:
+        h = "0" + h
+    # simple guard: cap to ~6KB data if needed (EVM calldata gas)
+    if len(h) > 12000:
+        raise ValueError("poe_hash payload too large")
+    return "0x" + h
+
+
+def push_to_chain(poe_hash_hex: str) -> Dict[str, Any]:
+    """
+    Creates a **data-only, zero-value** tx sending to our own address,
+    embedding the PoE hash. Returns {tx_hash}.
+    """
+    if not rpc:
+        logger.info(f"[SIMULATION] push_to_chain: {poe_hash_hex[:16]}...")
+        return {"tx_hash": f"sim_{poe_hash_hex[:16]}_{int(time.time())}"}
+    
+    assert WALLET_ADDRESS and WALLET_PRIVATE_KEY, "Wallet env vars not set"
+    
+    nonce = get_nonce(WALLET_ADDRESS)
+    priorityFee, maxFee = estimate_fees()
+    gas_limit = 120000  # generous upper bound for data-only tx
+
+    tx = {
+        "from": WALLET_ADDRESS,
+        "to": WALLET_ADDRESS,
+        "value": _to_hex(0),
+        "nonce": _to_hex(nonce),
+        "gas": _to_hex(gas_limit),
+        "maxPriorityFeePerGas": _to_hex(priorityFee),
+        "maxFeePerGas": _to_hex(maxFee),
+        "data": _poe_data_bytes(poe_hash_hex),
+        "type": "0x2",  # EIP-1559
+    }
+
+    # --- signing path ---
+    try:
+        tx_hash = rpc.call("eth_sendTransaction", [tx])
+        logger.info(f"broadcast tx nonce={nonce} tx_hash={tx_hash}")
+        return {"tx_hash": tx_hash}
+    except Exception as e:
+        # fall-through: try personal_sendTransaction if unlocked keystore exists on node
+        if USE_PERSONAL:
+            try:
+                tx_hash = rpc.call("personal_sendTransaction", [tx, ""])
+                logger.info(f"broadcast (personal) tx nonce={nonce} tx_hash={tx_hash}")
+                return {"tx_hash": tx_hash}
+            except Exception as e2:
+                logger.error(f"RPC send failed: {e2}")
+                raise
+        else:
+            logger.error(
+                "Node rejected eth_sendTransaction. For air-gapped signing, add eth_account and signRaw."
+            )
+            raise
+
+
+def get_tx_receipt(tx_hash: str) -> Optional[Dict[str, Any]]:
+    """Get transaction receipt"""
+    if not rpc:
+        return {"status": "0x1", "blockNumber": hex(get_chain_head())}  # Simulate success
+    
+    r = rpc.call("eth_getTransactionReceipt", [tx_hash])
+    return r  # may be None until mined
+
+
+def ping_rpc() -> Tuple[bool, int]:
+    """Returns (ok, chain_latency_ms)"""
+    t0 = time.perf_counter()
+    try:
+        _ = get_chain_head()
+        ms = int((time.perf_counter() - t0) * 1000)
+        return True, ms
+    except Exception:
+        return False, -1
+
+
 class BlockchainClient:
-    """Enhanced blockchain client for PoD/PoE transactions with local ledger"""
+    """Enhanced blockchain client for PoD/PoE transactions with local ledger and EVM integration"""
     
     def __init__(self):
         self.rpc_url = CHAIN_RPC
         self.private_key = WALLET_PRIVATE_KEY
         self.wallet_address = WALLET_ADDRESS
-        self.session: Optional[aiohttp.ClientSession] = None
         self.pg_connection = None
         
     def _get_db_connection(self):
@@ -49,16 +213,11 @@ class BlockchainClient:
             self.pg_connection = connect_pg(PG_HOST, PG_PORT, PG_DB, PG_USER, PG_PASS)
         return self.pg_connection
     
-    async def _get_session(self) -> aiohttp.ClientSession:
-        """Get or create aiohttp session"""
-        if self.session is None or self.session.closed:
-            self.session = aiohttp.ClientSession()
-        return self.session
-    
     async def close(self):
-        """Close the session"""
-        if self.session and not self.session.closed:
-            await self.session.close()
+        """Close any resources"""
+        if self.pg_connection:
+            self.pg_connection.close()
+            self.pg_connection = None
     
     def _generate_pod_hash(self, data: Dict[str, Any]) -> str:
         """Generate Proof of Data hash"""
@@ -242,43 +401,28 @@ class BlockchainClient:
                 user_id=data.get("user_id", "system")
             )
             
-            # Simulate or execute blockchain transaction
-            if self.rpc_url == "https://your-chain-endpoint":
-                print(f"[SIMULATION] PoD Transaction: {pod_hash[:16]}...")
-                return {
-                    "status": "success",
-                    "transaction_hash": f"pod_{pod_hash[:32]}",
-                    "pod_hash": pod_hash,
-                    "timestamp": timestamp,
-                    "ledger": ledger_result,
-                    "simulation": True
-                }
+            # Record in PoD/PoE cache for chain processing
+            try:
+                pg = self._get_db_connection()
+                with pg.cursor() as cur:
+                    cur.execute("""
+                        INSERT INTO pods_poe (poe_hash, pod_hash, content_type, execution_data, on_chain)
+                        VALUES (%s, %s, %s, %s, %s)
+                        ON CONFLICT (poe_hash) DO NOTHING
+                    """, (pod_hash, pod_hash, "pod", json.dumps(data), False))
+                    pg.commit()
+            except Exception as e:
+                logger.warning(f"Failed to record PoD in cache: {e}")
             
-            # Real blockchain transaction
-            session = await self._get_session()
-            transaction_payload = {
-                "type": "POD",
-                "data_hash": pod_hash,
+            # For PoD, we don't immediately push to chain - that's handled by orchestrator
+            return {
+                "status": "success",
+                "transaction_hash": f"pod_{pod_hash[:16]}_{int(time.time())}",
+                "pod_hash": pod_hash,
                 "timestamp": timestamp,
-                "wallet_address": self.wallet_address,
-                "ledger_reference": ledger_result.get("ledger_id")
+                "ledger": ledger_result,
+                "chain_pending": True
             }
-            
-            async with session.post(
-                f"{self.rpc_url}/transactions",
-                json=transaction_payload,
-                headers={"Authorization": f"Bearer {self.private_key}"}
-            ) as response:
-                result = await response.json()
-                
-                return {
-                    "status": "success" if response.status == 200 else "error",
-                    "transaction_hash": result.get("hash"),
-                    "pod_hash": pod_hash,
-                    "timestamp": timestamp,
-                    "ledger": ledger_result,
-                    "response": result
-                }
                 
         except Exception as e:
             return {
@@ -324,48 +468,32 @@ class BlockchainClient:
                 user_id=execution_result.get("user_id", "system")
             )
             
-            # Simulate or execute blockchain transaction
-            if self.rpc_url == "https://your-chain-endpoint":
-                print(f"[SIMULATION] PoE Verification: {poe_hash[:16]}...")
-                return {
-                    "status": "success",
-                    "transaction_hash": f"poe_{poe_hash[:32]}",
-                    "pod_hash": pod_hash,
-                    "poe_hash": poe_hash,
-                    "timestamp": timestamp,
-                    "verification": "complete",
-                    "ledger": ledger_result,
-                    "simulation": True
-                }
+            # Record in PoD/PoE cache for chain processing
+            try:
+                pg = self._get_db_connection()
+                with pg.cursor() as cur:
+                    cur.execute("""
+                        INSERT INTO pods_poe (poe_hash, pod_hash, content_type, execution_data, on_chain)
+                        VALUES (%s, %s, %s, %s, %s)
+                        ON CONFLICT (poe_hash) DO UPDATE SET
+                        execution_data = EXCLUDED.execution_data,
+                        updated_at = now()
+                    """, (poe_hash, pod_hash, "poe", json.dumps(execution_result), False))
+                    pg.commit()
+                    logger.info(f"PoE cached for chain processing: {poe_hash[:16]}...")
+            except Exception as e:
+                logger.error(f"Failed to record PoE in cache: {e}")
             
-            # Real blockchain transaction
-            session = await self._get_session()
-            verification_payload = {
-                "type": "POE",
+            return {
+                "status": "success",
+                "transaction_hash": f"poe_{poe_hash[:16]}_{int(time.time())}",
                 "pod_hash": pod_hash,
                 "poe_hash": poe_hash,
                 "timestamp": timestamp,
-                "wallet_address": self.wallet_address,
-                "ledger_reference": ledger_result.get("ledger_id")
+                "verification": "complete",
+                "ledger": ledger_result,
+                "chain_pending": True
             }
-            
-            async with session.post(
-                f"{self.rpc_url}/verifications",
-                json=verification_payload,
-                headers={"Authorization": f"Bearer {self.private_key}"}
-            ) as response:
-                result = await response.json()
-                
-                return {
-                    "status": "success" if response.status == 200 else "error",
-                    "transaction_hash": result.get("hash"),
-                    "pod_hash": pod_hash,
-                    "poe_hash": poe_hash,
-                    "timestamp": timestamp,
-                    "verification": "complete",
-                    "ledger": ledger_result,
-                    "response": result
-                }
                 
         except Exception as e:
             return {
@@ -378,20 +506,43 @@ class BlockchainClient:
     async def get_transaction_status(self, transaction_hash: str) -> Dict[str, Any]:
         """Get status of a blockchain transaction"""
         try:
-            if self.rpc_url == "https://your-chain-endpoint":
-                return {
-                    "status": "confirmed",
-                    "transaction_hash": transaction_hash,
-                    "confirmations": 12,
-                    "simulation": True
-                }
+            # Check local ledger first
+            pg = self._get_db_connection()
+            with pg.cursor() as cur:
+                cur.execute("""
+                    SELECT status, block_number, created_at, updated_at 
+                    FROM blockchain_ledger 
+                    WHERE tx_hash = %s
+                """, (transaction_hash,))
+                result = cur.fetchone()
+                
+                if result:
+                    status, block_number, created_at, updated_at = result
+                    return {
+                        "status": status,
+                        "transaction_hash": transaction_hash,
+                        "block_number": block_number,
+                        "created_at": created_at.isoformat() if created_at else None,
+                        "updated_at": updated_at.isoformat() if updated_at else None,
+                        "source": "local_ledger"
+                    }
             
-            session = await self._get_session()
-            async with session.get(
-                f"{self.rpc_url}/transactions/{transaction_hash}",
-                headers={"Authorization": f"Bearer {self.private_key}"}
-            ) as response:
-                return await response.json()
+            # Fallback to chain query if available
+            if rpc and not transaction_hash.startswith(("pod_", "poe_", "sim_")):
+                receipt = get_tx_receipt(transaction_hash)
+                if receipt:
+                    return {
+                        "status": "confirmed" if receipt.get("status") == "0x1" else "failed",
+                        "transaction_hash": transaction_hash,
+                        "block_number": int(receipt["blockNumber"], 16) if receipt.get("blockNumber") else None,
+                        "source": "chain"
+                    }
+            
+            return {
+                "status": "pending",
+                "transaction_hash": transaction_hash,
+                "source": "unknown"
+            }
                 
         except Exception as e:
             return {
