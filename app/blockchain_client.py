@@ -341,13 +341,16 @@ class BlockchainClient:
                     else:
                         parsed_data = block_data
                     
-                    # Extract original data and timestamp
-                    hash_timestamp = parsed_data.pop("_hash_timestamp", None)
+                    # Extract timestamp but DON'T modify the original data
+                    hash_timestamp = parsed_data.get("_hash_timestamp")
+                    
+                    # Create data copy without timestamp for hash computation
+                    data_for_hash = {k: v for k, v in parsed_data.items() if k != "_hash_timestamp"}
                     
                     # Compute hash using the stored timestamp
-                    computed_hash = self._compute_chain_hash(parsed_data, previous_hash, hash_timestamp)
+                    computed_hash = self._compute_chain_hash(data_for_hash, previous_hash, hash_timestamp)
                     if current_hash != computed_hash:
-                        broken_links.append(f"Block {ledger_id} hash verification failed")
+                        broken_links.append(f"Block {ledger_id} hash verification failed: expected {computed_hash}, got {current_hash}")
                     else:
                         verified_count += 1
                 except Exception as e:

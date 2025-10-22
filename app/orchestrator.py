@@ -18,6 +18,7 @@ import time
 
 from psycopg_fix import connect_pg
 from blockchain_client import BlockchainClient, record_pod, record_poe, add_to_ledger, verify_chain_integrity
+from windows_logging import setup_windows_safe_logging, configure_system_encoding
 from dotenv import load_dotenv
 
 # Load environment variables
@@ -93,29 +94,10 @@ class GentleOmegaOrchestrator:
         
         log_file = os.path.join(log_dir, "agent_orchestration.log")
         
-        # Configure logger
-        self.logger = logging.getLogger("GentleOmegaOrchestrator")
-        self.logger.setLevel(logging.INFO)
-        
-        # File handler
-        file_handler = logging.FileHandler(log_file)
-        file_handler.setLevel(logging.INFO)
-        
-        # Console handler
-        console_handler = logging.StreamHandler()
-        console_handler.setLevel(logging.INFO)
-        
-        # Formatter
-        formatter = logging.Formatter(
-            '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-        )
-        file_handler.setFormatter(formatter)
-        console_handler.setFormatter(formatter)
-        
-        # Add handlers if not already added
-        if not self.logger.handlers:
-            self.logger.addHandler(file_handler)
-            self.logger.addHandler(console_handler)
+        # Configure Windows-safe logger
+        # Configure Windows-safe logger
+        configure_system_encoding()
+        self.logger = setup_windows_safe_logging("GentleOmegaOrchestrator", logging.INFO)
     
     def get_db_connection(self):
         """Get database connection for orchestration operations"""
