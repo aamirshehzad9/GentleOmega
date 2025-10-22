@@ -13,6 +13,9 @@ from openai import OpenAI
 # Import blockchain integration
 from blockchain_client import record_pod, record_poe, cleanup_blockchain_client
 
+# Import orchestration system
+from orchestrator import start_orchestration, stop_orchestration, submit_create_item_task, get_orchestration_health
+
 # Load environment variables
 load_dotenv(dotenv_path=os.path.join("env", ".env"))
 
@@ -214,31 +217,45 @@ async def embed(text: str, background_tasks: BackgroundTasks):
 
 
 @app.post("/items")
-async def create_item(content: str, user_id: str = "default"):
-    """Create new item with blockchain PoD tracking"""
-    try:
-        with pg.cursor() as cur:
-            cur.execute(
-                "INSERT INTO items (content, user_id, created_at) VALUES (%s, %s, NOW()) RETURNING id, created_at",
-                (content, user_id)
-            )
-            result = cur.fetchone()
-            item_id, created_at = result
-        
+async def create_item(content: str, user_id: str = "default", use_orchestration: bool = False):
+    """Create new item with optional orchestration and blockchain PoD tracking"""
+    if use_orchestration:
+        # Use orchestration system for background processing
+        task_id = submit_create_item_task(content, user_id)
         return {
-            "status": "success",
-            "item_id": item_id,
+            "status": "submitted",
+            "task_id": task_id,
             "content": content,
             "user_id": user_id,
-            "created_at": created_at.isoformat(),
-            "message": "Item created - blockchain PoD/PoE will be processed automatically"
+            "message": "Item creation submitted to orchestration system",
+            "orchestrated": True
         }
-    
-    except Exception as e:
-        return {
-            "status": "error",
-            "error": str(e)
-        }
+    else:
+        # Direct creation (legacy mode)
+        try:
+            with pg.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO items (content, user_id, created_at) VALUES (%s, %s, NOW()) RETURNING id, created_at",
+                    (content, user_id)
+                )
+                result = cur.fetchone()
+                item_id, created_at = result
+            
+            return {
+                "status": "success",
+                "item_id": item_id,
+                "content": content,
+                "user_id": user_id,
+                "created_at": created_at.isoformat(),
+                "message": "Item created directly",
+                "orchestrated": False
+            }
+        
+        except Exception as e:
+            return {
+                "status": "error",
+                "error": str(e)
+            }
 
 
 @app.get("/items/{item_id}")
@@ -329,10 +346,47 @@ async def get_item(item_id: int, background_tasks: BackgroundTasks):
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "dim": DIM, "blockchain": "enabled"}
+    orchestration_health = get_orchestration_health()
+    return {
+        "status": "ok", 
+        "dim": DIM, 
+        "blockchain": "enabled",
+        "orchestration": orchestration_health
+    }
+
+@app.get("/orchestration/status")
+def orchestration_status():
+    """Get detailed orchestration status"""
+    return get_orchestration_health()
+
+@app.post("/orchestration/task")
+def submit_orchestration_task(content: str, user_id: str = "default"):
+    """Submit task through orchestration system"""
+    task_id = submit_create_item_task(content, user_id)
+    return {
+        "status": "submitted",
+        "task_id": task_id,
+        "message": "Task submitted for orchestrated processing"
+    }
 
 
-# Shutdown handler for blockchain client cleanup
+# Startup handler for orchestration system
+@app.on_event("startup")
+async def startup_event():
+    """Initialize orchestration system on app startup"""
+    try:
+        await start_orchestration()
+        print("GentleOmega Orchestration System started successfully")
+    except Exception as e:
+        print(f"Warning: Orchestration startup failed: {e}")
+
+# Shutdown handler for cleanup
 @app.on_event("shutdown")
 async def shutdown_event():
-    await cleanup_blockchain_client()
+    """Cleanup on app shutdown"""
+    try:
+        await stop_orchestration()
+        await cleanup_blockchain_client()
+        print("GentleOmega systems shutdown complete")
+    except Exception as e:
+        print(f"Warning: Shutdown error: {e}")
