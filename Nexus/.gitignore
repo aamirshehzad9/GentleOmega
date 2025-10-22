@@ -1,0 +1,22 @@
+# general
+.DS_Store
+node_modules
+dist
+.build
+.env
+.env.*
+*.log
+logs/
+__pycache__/
+*.pyc
+
+# python venvs
+.venv/
+venv/
+
+# nextjs
+.next/
+out/
+
+# docker
+*.pid

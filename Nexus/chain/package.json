@@ -1,0 +1,17 @@
+{
+  "name": "gx-chain",
+  "private": true,
+  "scripts": {
+    "compile": "hardhat compile",
+    "test": "hardhat test",
+    "deploy": "hardhat run scripts/deploy.ts --network sepolia"
+  },
+  "devDependencies": {
+    "hardhat": "2.22.10",
+    "@nomicfoundation/hardhat-toolbox": "^5.0.0",
+    "typescript": "5.6.2",
+    "ts-node": "10.9.2",
+    "ethers": "6.13.2",
+    "dotenv": "16.4.5"
+  }
+}
