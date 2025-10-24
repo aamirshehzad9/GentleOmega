@@ -1,0 +1,138 @@
+version: '3.8'
+
+networks:
+  gomini_net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/16
+  
+  # Bridge to AITB network
+  aitb_bridge:
+    external: true
+    name: aitb_net
+
+services:
+  gomini-core:
+    container_name: GOmini-AI-Core
+    build:
+      context: ../services/gomini-core
+      dockerfile: Dockerfile
+    networks:
+      - gomini_net
+    ports:
+      - "8505:8505"
+    volumes:
+      - D:/GentleOmega/GOmini/models:/app/models:rw
+      - D:/GentleOmega/GOmini/data:/app/data:rw
+      - D:/GentleOmega/GOmini/logs:/app/logs:rw
+      - D:/GentleOmega/GOmini/config:/app/config:ro
+    environment:
+      - GOMINI_MODE=hybrid
+      - GOMINI_PORT=8505
+      - GOMINI_HOST=0.0.0.0
+      - HF_CACHE_DIR=/app/models/huggingface
+      - TRANSFORMERS_CACHE=/app/models/transformers
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8505/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+  gomini-vector:
+    container_name: GOmini-AI-Vector
+    build:
+      context: ../services/gomini-vector
+      dockerfile: Dockerfile
+    networks:
+      - gomini_net
+    ports:
+      - "8506:8506"
+    volumes:
+      - D:/GentleOmega/GOmini/data/vector:/app/vector_db:rw
+      - D:/GentleOmega/GOmini/logs:/app/logs:rw
+    environment:
+      - VECTOR_DB_TYPE=chroma
+      - VECTOR_PORT=8506
+      - VECTOR_HOST=0.0.0.0
+      - PERSIST_DIRECTORY=/app/vector_db
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8506/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    depends_on:
+      - gomini-core
+
+  gomini-api:
+    container_name: GOmini-AI-API
+    build:
+      context: ../services/gomini-api
+      dockerfile: Dockerfile
+    networks:
+      - gomini_net
+      - aitb_bridge
+    ports:
+      - "8507:8507"
+    volumes:
+      - D:/GentleOmega/GOmini/logs:/app/logs:rw
+      - D:/GentleOmega/GOmini/config:/app/config:ro
+    environment:
+      - API_PORT=8507
+      - API_HOST=0.0.0.0
+      - GOMINI_CORE_URL=http://gomini-core:8505
+      - GOMINI_VECTOR_URL=http://gomini-vector:8506
+      - SIGNALR_ENABLED=true
+      - GRPC_ENABLED=true
+      - AUTH_REQUIRED=true
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8507/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    depends_on:
+      - gomini-core
+      - gomini-vector
+
+  gomini-gateway:
+    container_name: GOmini-Gateway
+    build:
+      context: ../services/gomini-gateway
+      dockerfile: Dockerfile
+    networks:
+      - gomini_net
+      - aitb_bridge
+    ports:
+      - "8508:8508"
+    volumes:
+      - D:/GentleOmega/GOmini/logs:/app/logs:rw
+      - D:/GentleOmega/GOmini/config:/app/config:ro
+    environment:
+      - GATEWAY_PORT=8508
+      - GATEWAY_HOST=0.0.0.0
+      - AITB_NETWORK=aitb_bridge
+      - GOMINI_NETWORK=gomini_net
+      - USER_CONFIRMATION=true
+      - CREDENTIAL_STORE=windows
+    restart: unless-stopped
+    depends_on:
+      - gomini-api
+
+volumes:
+  gomini_models:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: D:/GentleOmega/GOmini/models
+  
+  gomini_data:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: D:/GentleOmega/GOmini/data
