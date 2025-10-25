@@ -3,7 +3,7 @@ networks:
     driver: bridge
     ipam:
       config:
-        - subnet: 172.20.0.0/16
+        - subnet: 172.22.0.0/16
   
   # Bridge to AITB network
   aitb_bridge:
@@ -11,6 +11,32 @@ networks:
     name: aitb_net
 
 services:
+  # GOmini-AI MCP Hub - FastAPI Server
+  gomini-mcp:
+    container_name: GOmini-MCP-Hub
+    build:
+      context: ../services/mcp-hub
+      dockerfile: Dockerfile
+    ports:
+      - "8600:8600"
+    volumes:
+      - D:/GentleOmega/models:/models
+      - D:/GentleOmega/logs:/logs
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      - PYTHONPATH=/app
+      - MCP_PORT=8600
+      - MODELS_PATH=/models
+      - LOGS_PATH=/logs
+    networks:
+      - gomini_net
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8600/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    restart: unless-stopped
+
   gomini-core:
     container_name: GOmini-AI-Core
     build:
